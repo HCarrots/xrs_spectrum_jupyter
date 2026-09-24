@@ -5,13 +5,16 @@ from typing import Any, Iterable
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import LogNorm
 from matplotlib.patches import Polygon as PolygonPatch
 from matplotlib.patches import Rectangle
 from matplotlib.path import Path as PolygonPath
+from matplotlib.ticker import LogFormatterSciNotation
 from matplotlib.widgets import Button
 
 
 ROI_MODES = ("free", "rectangle")
+LOG_FLOOR = 1e-6
 
 VALID_LABELS = (
     "VB-A1", "VB-A2", "VB-A3", "VB-B1", "VB-B2", "VB-B3",
@@ -37,6 +40,31 @@ def _normalise_roi_mode(roi_mode: str) -> str:
         choices = ", ".join(ROI_MODES)
         raise ValueError(f"roi_mode must be one of: {choices}")
     return mode
+
+
+def _positive_image(image: np.ndarray) -> np.ndarray:
+    """Return finite positive data suitable for logarithmic processing."""
+
+    image = np.asarray(image, dtype=np.float32)
+    finite_positive = image[np.isfinite(image) & (image > 0)]
+    positive_max = (
+        float(finite_positive.max()) if finite_positive.size else LOG_FLOOR
+    )
+    positive = np.nan_to_num(
+        image,
+        nan=LOG_FLOOR,
+        posinf=positive_max,
+        neginf=LOG_FLOOR,
+    )
+    positive[positive <= 0] = LOG_FLOOR
+    return positive
+
+
+def _prepare_log_data(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return safe positive intensities and their base-10 logarithm."""
+
+    positive = _positive_image(image)
+    return positive, np.log10(positive)
 
 
 def _robust_threshold(
@@ -108,12 +136,16 @@ def detect_candidates(
     morphology_kernel: int = 5,
     approximation_ratio: float = 0.0,
 ) -> list[dict[str, Any]]:
-    """Detect bright regions as free-shape or rectangular ROI candidates."""
+    """Detect bright regions as free-shape or rectangular ROI candidates.
+
+    Detection uses one base-10 log transform after non-positive and invalid
+    values are replaced safely. Reported intensity summaries remain linear.
+    """
 
     mode = _normalise_roi_mode(roi_mode)
-    image = np.asarray(image, dtype=np.float32)
-    if image.ndim != 2:
-        raise ValueError(f"Expected a 2-D image; got shape {image.shape}")
+    source_image = np.asarray(image, dtype=np.float32)
+    if source_image.ndim != 2:
+        raise ValueError(f"Expected a 2-D image; got shape {source_image.shape}")
     if min_area < 1:
         raise ValueError("min_area must be at least 1")
     if max_area is not None and max_area < min_area:
@@ -127,8 +159,8 @@ def detect_candidates(
     if not 0.0 <= approximation_ratio <= 0.2:
         raise ValueError("approximation_ratio must be between 0 and 0.2")
 
-    image = np.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
-    denoised = cv2.GaussianBlur(image, (0, 0), denoise_sigma)
+    intensity_image, detection_image = _prepare_log_data(source_image)
+    denoised = cv2.GaussianBlur(detection_image, (0, 0), denoise_sigma)
     background = cv2.GaussianBlur(denoised, (0, 0), background_sigma)
     signal = denoised - background
     threshold = _robust_threshold(signal, threshold_percentile, threshold_sigma)
@@ -202,8 +234,10 @@ def detect_candidates(
             "bbox": (x, y, width, height),
             "area": area,
             "contour_area": contour_area,
-            "max_intensity": float(image[component_mask].max()),
-            "total_intensity": float(image[component_mask].sum(dtype=np.float64)),
+            "max_intensity": float(intensity_image[component_mask].max()),
+            "total_intensity": float(
+                intensity_image[component_mask].sum(dtype=np.float64)
+            ),
             "background_corrected_intensity": corrected_sum,
             "perimeter": perimeter,
             "circularity": circularity,
@@ -255,8 +289,9 @@ def annotate_candidates(
     roi_mode: str = "free",
     valid_labels: Iterable[str] = VALID_LABELS,
     figsize: tuple[float, float] = (8.0, 6.0),
+    detector_label: str = "D_LAMBDA",
 ) -> list[dict[str, Any]]:
-    """Assign analyser labels interactively to detected ROI candidates."""
+    """Assign labels on a LogNorm image styled like ``xrs_IO.plot_det_image``."""
 
     mode = _normalise_roi_mode(roi_mode)
     image = np.asarray(image)
@@ -271,11 +306,24 @@ def annotate_candidates(
     selected: dict[str, dict[str, Any] | None] = {"candidate": None}
     figure = plt.figure(figsize=figsize)
     axis = figure.add_axes((0.05, 0.08, 0.61, 0.86))
-    axis.imshow(image, cmap="gray", origin="upper")
-    axis.set_xlabel("Pixel x")
-    axis.set_ylabel("Pixel y")
+    display_image = _positive_image(image)
+    image_artist = axis.imshow(
+        display_image,
+        cmap="viridis",
+        origin="upper",
+        norm=LogNorm(),
+    )
+    colorbar = figure.colorbar(image_artist, ax=axis)
+    formatter = LogFormatterSciNotation(base=10, labelOnlyBase=False)
+    formatter._useMathText = False
+    colorbar.formatter = formatter
+    colorbar.update_ticks()
+    colorbar.set_label(f"{detector_label} sum value (log scale)")
+    axis.set_xlabel("Column")
+    axis.set_ylabel("Row")
     status = axis.set_title(
-        f"{mode.capitalize()} ROI: select a candidate, then choose a label"
+        f"{mode.capitalize()} ROI on summed {detector_label}: "
+        "select a candidate, then choose a label"
     )
 
     patches: dict[str, Any] = {}
@@ -450,6 +498,7 @@ def interactive_roi(
     initial_mode: str = "free",
     valid_labels: Iterable[str] = VALID_LABELS,
     figsize: tuple[float, float] = (8.0, 6.0),
+    detector_label: str = "D_LAMBDA",
     **detection_kwargs: Any,
 ) -> dict[str, Any]:
     """Display Jupyter controls for choosing, detecting, and labelling ROIs.
@@ -521,6 +570,7 @@ def interactive_roi(
                     roi_mode=selected_mode,
                     valid_labels=valid_labels,
                     figsize=figsize,
+                    detector_label=detector_label,
                 )
             else:
                 print("No ROI candidates were detected with the current settings.")
