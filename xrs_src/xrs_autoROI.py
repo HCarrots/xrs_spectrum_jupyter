@@ -18,6 +18,8 @@ from matplotlib.widgets import Button
 
 
 ROI_MODES = ("free", "rectangle")
+DETECTION_METHODS = ("adaptive", "threshold")
+DENOISE_METHODS = ("bilateral", "gaussian", "none")
 LOG_FLOOR = 1e-6
 ROI_TXT_VERSION = 1
 DEFAULT_ROI_DIR = Path(__file__).resolve().parent.parent / "ROI"
@@ -71,6 +73,26 @@ def _normalise_roi_mode(roi_mode: str) -> str:
         choices = ", ".join(ROI_MODES)
         raise ValueError(f"roi_mode must be one of: {choices}")
     return mode
+
+
+def _normalise_detection_method(detection_method: str) -> str:
+    """Validate and normalise an ROI detection method."""
+
+    method = str(detection_method).strip().lower()
+    if method not in DETECTION_METHODS:
+        choices = ", ".join(DETECTION_METHODS)
+        raise ValueError(f"detection_method must be one of: {choices}")
+    return method
+
+
+def _normalise_denoise_method(denoise_method: str) -> str:
+    """Validate and normalise detection-image denoising."""
+
+    method = str(denoise_method).strip().lower()
+    if method not in DENOISE_METHODS:
+        choices = ", ".join(DENOISE_METHODS)
+        raise ValueError(f"denoise_method must be one of: {choices}")
+    return method
 
 
 def scan_number_from_source(scan_source: str | Path | int) -> str:
@@ -470,10 +492,473 @@ def _validate_detection_parameters(
         raise ValueError("approximation_ratio must be between 0 and 0.2")
 
 
+def _normalised_gaussian(
+    values: np.ndarray,
+    valid_mask: np.ndarray,
+    sigma: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Blur data while preventing zero/dead pixels from creating false edges."""
+
+    weights = cv2.GaussianBlur(
+        valid_mask.astype(np.float32), (0, 0), float(sigma)
+    )
+    weighted_values = cv2.GaussianBlur(
+        values * valid_mask, (0, 0), float(sigma)
+    )
+    return weighted_values / np.maximum(weights, 1e-4), weights
+
+
+def _multiscale_response(
+    image: np.ndarray,
+    *,
+    scales: tuple[float, ...] = (1.5, 2.5, 4.0, 6.5, 10.0),
+    denoise_method: str = "bilateral",
+    denoise_strength: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return a dead-pixel-aware, multi-scale local-contrast response."""
+
+    method = _normalise_denoise_method(denoise_method)
+    intensity_image = _positive_image(image)
+    valid_mask = np.isfinite(image) & (np.asarray(image) > 0)
+    log_image = np.zeros_like(intensity_image, dtype=np.float32)
+    log_image[valid_mask] = np.log10(intensity_image[valid_mask])
+    if method != "none":
+        filled_image, _ = _normalised_gaussian(log_image, valid_mask, 2.0)
+        working_image = log_image.copy()
+        working_image[~valid_mask] = filled_image[~valid_mask]
+        if method == "bilateral":
+            working_image = cv2.bilateralFilter(
+                working_image,
+                d=0,
+                sigmaColor=0.18 * denoise_strength,
+                sigmaSpace=3.0 * denoise_strength,
+            )
+        else:
+            working_image = cv2.GaussianBlur(
+                working_image,
+                (0, 0),
+                max(0.25, denoise_strength),
+            )
+        log_image[valid_mask] = working_image[valid_mask]
+    responses = []
+    for sigma in scales:
+        foreground, coverage = _normalised_gaussian(
+            log_image, valid_mask, sigma
+        )
+        background, _ = _normalised_gaussian(
+            log_image, valid_mask, max(12.0, 4.0 * sigma)
+        )
+        response = foreground - background
+        response[coverage < 0.45] = 0.0
+        responses.append(response)
+    response_stack = np.stack(responses)
+    scale_indices = np.argmax(response_stack, axis=0)
+    scale_values = np.asarray(scales, dtype=np.float32)[scale_indices]
+    return intensity_image, np.max(response_stack, axis=0), scale_values
+
+
+def _infer_central_seam(valid_mask: np.ndarray, axis: int) -> int:
+    """Locate a detector seam near the image centre, with midpoint fallback."""
+
+    profile = valid_mask.mean(axis=axis).astype(np.float32)
+    length = len(profile)
+    midpoint = length // 2
+    radius = max(4, int(round(length * 0.12)))
+    start = max(1, midpoint - radius)
+    stop = min(length - 1, midpoint + radius + 1)
+    local_index = int(np.argmin(profile[start:stop])) + start
+    reference = float(np.median(profile))
+    if reference <= 0 or profile[local_index] > 0.55 * reference:
+        return midpoint
+
+    low = profile <= min(0.55 * reference, profile[local_index] + 0.05)
+    left = local_index
+    right = local_index
+    while left > start and low[left - 1]:
+        left -= 1
+    while right + 1 < stop and low[right + 1]:
+        right += 1
+    return (left + right + 1) // 2
+
+
+def _factor_grid(candidate_count: int, *, tall: bool) -> tuple[int, int]:
+    """Choose a near-rectangular rows/columns grid for one detector panel."""
+
+    if not isinstance(candidate_count, (int, np.integer)) or candidate_count < 1:
+        raise ValueError("candidates_per_panel must be an integer of at least 1")
+    factor_pairs = [
+        (candidate_count // divisor, divisor)
+        for divisor in range(1, int(np.sqrt(candidate_count)) + 1)
+        if candidate_count % divisor == 0
+    ]
+    rows, columns = min(factor_pairs, key=lambda pair: abs(pair[0] - pair[1]))
+    if tall:
+        return max(rows, columns), min(rows, columns)
+    return min(rows, columns), max(rows, columns)
+
+
+def _fit_regular_axis(
+    profile: np.ndarray,
+    count: int,
+    *,
+    span_fraction: float,
+) -> list[int]:
+    """Fit regularly spaced positions, allowing local response-driven jitter."""
+
+    profile = np.asarray(profile, dtype=np.float32).reshape(1, -1)
+    profile = cv2.GaussianBlur(profile, (0, 0), 2.0).ravel()
+    length = len(profile)
+    if count == 1:
+        return [int(np.argmax(profile))]
+
+    target_span = span_fraction * (length - 1)
+    target_step = target_span / (count - 1)
+    target_start = ((length - 1) - target_span) / 2.0
+    best: tuple[float, list[int]] | None = None
+    step_min = max(3, int(round(0.96 * target_step)))
+    step_max = max(step_min, int(round(1.04 * target_step)))
+    start_radius = max(2, int(round(0.08 * length)))
+
+    for step in range(step_min, step_max + 1):
+        nominal_start = int(round(target_start))
+        start_min = max(3, nominal_start - start_radius)
+        start_max = min(
+            length - 4 - (count - 1) * step,
+            nominal_start + start_radius,
+        )
+        for start in range(start_min, start_max + 1):
+            jitter = max(2, int(round(0.14 * step)))
+            positions = []
+            score = 0.0
+            for index in range(count):
+                nominal = start + index * step
+                low = max(0, nominal - jitter)
+                high = min(length, nominal + jitter + 1)
+                position = low + int(np.argmax(profile[low:high]))
+                positions.append(position)
+                score += float(profile[position])
+            if best is None or score > best[0]:
+                best = (score, positions)
+
+    if best is None:
+        return [
+            int(round(value))
+            for value in np.linspace(target_start, target_start + target_span, count)
+        ]
+    return best[1]
+
+
+def _candidate_from_mask(
+    component_mask: np.ndarray,
+    intensity_image: np.ndarray,
+    signal: np.ndarray,
+    *,
+    roi_mode: str,
+    approximation_ratio: float,
+) -> dict[str, Any] | None:
+    """Build the public candidate record from one full-image component mask."""
+
+    mode = _normalise_roi_mode(roi_mode)
+    contours, _ = cv2.findContours(
+        component_mask.astype(np.uint8) * 255,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE if mode == "free" else cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    perimeter = float(cv2.arcLength(contour, True))
+    contour_area = float(cv2.contourArea(contour))
+    if mode == "free" and (perimeter <= 0 or contour_area <= 0):
+        return None
+
+    ys, xs = np.nonzero(component_mask)
+    if not len(xs):
+        return None
+    x, y, width, height = cv2.boundingRect(contour)
+    points_xy = np.column_stack((xs, ys))
+    corrected_values = np.maximum(signal[component_mask], 0.0).astype(np.float64)
+    geometric_center = (float(xs.mean()), float(ys.mean()))
+    corrected_sum = float(corrected_values.sum())
+    if corrected_sum > 0:
+        weighted_center = (
+            float(np.dot(xs, corrected_values) / corrected_sum),
+            float(np.dot(ys, corrected_values) / corrected_sum),
+        )
+    else:
+        weighted_center = geometric_center
+
+    major, minor, pca_ratio = _pca_features(points_xy)
+    circularity = (
+        float(4.0 * np.pi * contour_area / perimeter**2)
+        if perimeter > 0
+        else 0.0
+    )
+    candidate = {
+        "candidate_id": "",
+        "label": None,
+        "center": geometric_center,
+        "weighted_center": weighted_center,
+        "bbox": (int(x), int(y), int(width), int(height)),
+        "area": int(component_mask.sum()),
+        "contour_area": contour_area,
+        "max_intensity": float(intensity_image[component_mask].max()),
+        "total_intensity": float(
+            intensity_image[component_mask].sum(dtype=np.float64)
+        ),
+        "background_corrected_intensity": corrected_sum,
+        "perimeter": perimeter,
+        "circularity": circularity,
+        "aspect_ratio": max(width, height) / max(min(width, height), 1),
+        "pca_major": major,
+        "pca_minor": minor,
+        "pca_ratio": pca_ratio,
+    }
+    if mode == "free":
+        polygon_array = _closed_polygon(contour, approximation_ratio)
+        candidate["polygon"] = tuple(
+            (float(x_value), float(y_value))
+            for x_value, y_value in polygon_array
+        )
+    return candidate
+
+
+def _adaptive_component_mask(
+    response: np.ndarray,
+    peak_x: int,
+    peak_y: int,
+    *,
+    radius_x: int,
+    radius_y: int,
+    scale: float,
+    min_area: int,
+    max_area: int | None,
+) -> np.ndarray:
+    """Grow a bounded component around a grid-regularised response peak."""
+
+    height, width = response.shape
+    left = max(0, peak_x - radius_x)
+    right = min(width, peak_x + radius_x + 1)
+    top = max(0, peak_y - radius_y)
+    bottom = min(height, peak_y + radius_y + 1)
+    patch = np.maximum(response[top:bottom, left:right], 0.0)
+    positive = patch[patch > 0]
+
+    component: np.ndarray | None = None
+    if positive.size:
+        median = float(np.median(positive))
+        mad = float(np.median(np.abs(positive - median)))
+        peak_value = float(patch[peak_y - top, peak_x - left])
+        threshold = max(
+            float(np.percentile(positive, 70.0)),
+            median + 0.60 * 1.4826 * mad,
+            0.30 * peak_value,
+        )
+        binary = (patch >= threshold).astype(np.uint8)
+        binary = cv2.morphologyEx(
+            binary, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8)
+        )
+        component_count, labels = cv2.connectedComponents(binary, connectivity=8)
+        seed_label = int(labels[peak_y - top, peak_x - left])
+        if component_count > 1 and seed_label:
+            component = labels == seed_label
+
+    area_limit = max_area if max_area is not None else np.inf
+    if component is None or component.sum() < min_area or component.sum() > area_limit:
+        minimum_radius = max(2.0, np.sqrt(min_area / np.pi))
+        ellipse_radius_x = min(
+            float(radius_x), max(minimum_radius, 2.2 * float(scale))
+        )
+        ellipse_radius_y = min(
+            float(radius_y), max(minimum_radius, 2.2 * float(scale))
+        )
+        if max_area is not None:
+            ellipse_area = np.pi * ellipse_radius_x * ellipse_radius_y
+            if ellipse_area > max_area:
+                shrink = np.sqrt(max_area / ellipse_area)
+                ellipse_radius_x *= shrink
+                ellipse_radius_y *= shrink
+        yy, xx = np.indices(patch.shape)
+        component = (
+            ((xx - (peak_x - left)) / max(ellipse_radius_x, 1.0)) ** 2
+            + ((yy - (peak_y - top)) / max(ellipse_radius_y, 1.0)) ** 2
+            <= 1.0
+        )
+
+    full_mask = np.zeros(response.shape, dtype=bool)
+    full_mask[top:bottom, left:right] = component
+    return full_mask
+
+
+def _detect_adaptive_candidates(
+    image: np.ndarray,
+    *,
+    roi_mode: str,
+    min_area: int,
+    max_area: int | None,
+    approximation_ratio: float,
+    candidates_per_panel: int,
+    seam_margin: int,
+    min_confidence: float,
+    denoise_method: str,
+    denoise_strength: float,
+) -> list[dict[str, Any]]:
+    """Detect a regular analyser grid independently in four detector panels."""
+
+    intensity_image, response, scale_values = _multiscale_response(
+        image,
+        denoise_method=denoise_method,
+        denoise_strength=denoise_strength,
+    )
+    valid_mask = np.isfinite(image) & (np.asarray(image) > 0)
+    height, width = response.shape
+    split_y = _infer_central_seam(valid_mask, axis=1)
+    split_x = _infer_central_seam(valid_mask, axis=0)
+    margin = max(1, int(seam_margin))
+    panel_bounds = (
+        (0, max(1, split_y - margin), 0, max(1, split_x - margin)),
+        (0, max(1, split_y - margin), min(width - 1, split_x + margin), width),
+        (min(height - 1, split_y + margin), height, 0, max(1, split_x - margin)),
+        (
+            min(height - 1, split_y + margin),
+            height,
+            min(width - 1, split_x + margin),
+            width,
+        ),
+    )
+    candidates: list[dict[str, Any]] = []
+
+    for panel_index, (top, bottom, left, right) in enumerate(panel_bounds):
+        panel_response = response[top:bottom, left:right].copy()
+        if min(panel_response.shape) < 8:
+            continue
+        border = min(6, max(1, min(panel_response.shape) // 12))
+        panel_response[:border] = 0.0
+        panel_response[-border:] = 0.0
+        panel_response[:, :border] = 0.0
+        panel_response[:, -border:] = 0.0
+        positive_response = np.maximum(panel_response, 0.0)
+
+        rows, columns = _factor_grid(
+            candidates_per_panel, tall=panel_index < 2
+        )
+        x_profile = np.percentile(positive_response, 95.0, axis=0)
+        y_profile = np.percentile(positive_response, 95.0, axis=1)
+        x_span = 0.58 if panel_index < 2 and columns < rows else 0.82
+        y_span = 0.82
+        x_positions = _fit_regular_axis(
+            x_profile, columns, span_fraction=x_span
+        )
+        y_positions = _fit_regular_axis(
+            y_profile, rows, span_fraction=y_span
+        )
+        x_spacing = (
+            float(np.median(np.diff(x_positions)))
+            if len(x_positions) > 1
+            else panel_response.shape[1] / 2.0
+        )
+        y_spacing = (
+            float(np.median(np.diff(y_positions)))
+            if len(y_positions) > 1
+            else panel_response.shape[0] / 2.0
+        )
+        search_radius_x = max(4, int(round(0.20 * x_spacing)))
+        search_radius_y = max(4, int(round(0.20 * y_spacing)))
+        region_radius_x = max(5, int(round(0.35 * x_spacing)))
+        region_radius_y = max(5, int(round(0.35 * y_spacing)))
+        panel_positive = positive_response[positive_response > 0]
+        confidence_floor = (
+            float(np.median(panel_positive)) if panel_positive.size else 0.0
+        )
+        confidence_high = (
+            float(np.percentile(panel_positive, 90.0))
+            if panel_positive.size
+            else 1.0
+        )
+
+        for grid_row, grid_y in enumerate(y_positions):
+            for grid_column, grid_x in enumerate(x_positions):
+                x0 = max(0, grid_x - search_radius_x)
+                x1 = min(panel_response.shape[1], grid_x + search_radius_x + 1)
+                y0 = max(0, grid_y - search_radius_y)
+                y1 = min(panel_response.shape[0], grid_y + search_radius_y + 1)
+                patch = positive_response[y0:y1, x0:x1]
+                yy, xx = np.indices(patch.shape)
+                prior = np.exp(
+                    -0.5
+                    * (
+                        ((xx - (grid_x - x0)) / max(0.55 * search_radius_x, 1.0))
+                        ** 2
+                        + ((yy - (grid_y - y0)) / max(0.55 * search_radius_y, 1.0))
+                        ** 2
+                    )
+                )
+                weighted_patch = patch * (0.4 + 0.6 * prior)
+                local_y, local_x = np.unravel_index(
+                    int(np.argmax(weighted_patch)), weighted_patch.shape
+                )
+                peak_x = int(left + x0 + local_x)
+                peak_y = int(top + y0 + local_y)
+                peak_score = float(response[peak_y, peak_x])
+                component_mask = _adaptive_component_mask(
+                    response,
+                    peak_x,
+                    peak_y,
+                    radius_x=region_radius_x,
+                    radius_y=region_radius_y,
+                    scale=float(scale_values[peak_y, peak_x]),
+                    min_area=min_area,
+                    max_area=max_area,
+                )
+                candidate = _candidate_from_mask(
+                    component_mask,
+                    intensity_image,
+                    response,
+                    roi_mode=roi_mode,
+                    approximation_ratio=approximation_ratio,
+                )
+                if candidate is None:
+                    continue
+                confidence_range = max(confidence_high - confidence_floor, 1e-6)
+                confidence = float(
+                    np.clip(
+                        (peak_score - confidence_floor) / confidence_range,
+                        0.0,
+                        1.0,
+                    )
+                )
+                candidate.update(
+                    {
+                        "detection_method": "adaptive",
+                        "denoise_method": denoise_method,
+                        "denoise_strength": denoise_strength,
+                        "detection_score": peak_score,
+                        "confidence": confidence,
+                        "detection_scale": float(scale_values[peak_y, peak_x]),
+                        "panel_index": panel_index,
+                        "grid_row": grid_row,
+                        "grid_column": grid_column,
+                    }
+                )
+                if confidence >= min_confidence:
+                    candidates.append(candidate)
+
+    candidates.sort(key=lambda item: (item["center"][1], item["center"][0]))
+    for index, candidate in enumerate(candidates, start=1):
+        candidate["candidate_id"] = f"candidate_{index:03d}"
+    return candidates
+
+
 def detect_candidates(
     image: np.ndarray,
     *,
     roi_mode: str = "free",
+    detection_method: str = "adaptive",
+    candidates_per_panel: int = 15,
+    seam_margin: int = 4,
+    min_confidence: float = 0.05,
+    denoise_method: str = "bilateral",
+    denoise_strength: float = 1.0,
     min_area: int = 20,
     max_area: int | None = None,
     threshold_percentile: float = 98.5,
@@ -483,13 +968,16 @@ def detect_candidates(
     morphology_kernel: int = 3,
     approximation_ratio: float = 0.0,
 ) -> list[dict[str, Any]]:
-    """Detect bright regions as free-shape or rectangular ROI candidates.
+    """Detect analyser regions as free-shape or rectangular ROI candidates.
 
-    Detection uses one base-10 log transform after non-positive and invalid
-    values are replaced safely. Reported intensity summaries remain linear.
+    ``adaptive`` uses a dead-pixel-aware multi-scale response plus the regular
+    analyser layout in each detector panel. ``threshold`` retains the original
+    global connected-component method. Reported intensities remain linear.
     """
 
     mode = _normalise_roi_mode(roi_mode)
+    method = _normalise_detection_method(detection_method)
+    selected_denoise_method = _normalise_denoise_method(denoise_method)
     source_image = np.asarray(image, dtype=np.float32)
     if source_image.ndim != 2:
         raise ValueError(f"Expected a 2-D image; got shape {source_image.shape}")
@@ -503,6 +991,26 @@ def detect_candidates(
         morphology_kernel=morphology_kernel,
         approximation_ratio=approximation_ratio,
     )
+    if not isinstance(seam_margin, (int, np.integer)) or seam_margin < 0:
+        raise ValueError("seam_margin must be a non-negative integer")
+    if not 0.0 <= min_confidence <= 1.0:
+        raise ValueError("min_confidence must be between 0 and 1")
+    if not np.isfinite(denoise_strength) or denoise_strength <= 0:
+        raise ValueError("denoise_strength must be a positive finite number")
+    _factor_grid(candidates_per_panel, tall=True)
+    if method == "adaptive":
+        return _detect_adaptive_candidates(
+            source_image,
+            roi_mode=mode,
+            min_area=min_area,
+            max_area=max_area,
+            approximation_ratio=approximation_ratio,
+            candidates_per_panel=candidates_per_panel,
+            seam_margin=seam_margin,
+            min_confidence=min_confidence,
+            denoise_method=selected_denoise_method,
+            denoise_strength=float(denoise_strength),
+        )
 
     intensity_image, detection_image = _prepare_log_data(source_image)
     denoised = cv2.GaussianBlur(detection_image, (0, 0), denoise_sigma)
@@ -895,6 +1403,12 @@ def interactive_roi(
     *,
     scan_source: str | Path | int,
     roi_mode: str = "free",
+    detection_method: str = "adaptive",
+    candidates_per_panel: int = 15,
+    seam_margin: int = 4,
+    min_confidence: float = 0.05,
+    denoise_method: str = "bilateral",
+    denoise_strength: float = 1.0,
     min_area: int = 20,
     max_area: int | None = None,
     threshold_percentile: float = 98.5,
@@ -914,6 +1428,8 @@ def interactive_roi(
     """
 
     mode = _normalise_roi_mode(roi_mode)
+    method = _normalise_detection_method(detection_method)
+    selected_denoise_method = _normalise_denoise_method(denoise_method)
     _validate_detection_parameters(
         min_area=min_area,
         max_area=max_area,
@@ -924,6 +1440,13 @@ def interactive_roi(
         morphology_kernel=morphology_kernel,
         approximation_ratio=approximation_ratio,
     )
+    if not isinstance(seam_margin, (int, np.integer)) or seam_margin < 0:
+        raise ValueError("seam_margin must be a non-negative integer")
+    if not 0.0 <= min_confidence <= 1.0:
+        raise ValueError("min_confidence must be between 0 and 1")
+    if not np.isfinite(denoise_strength) or denoise_strength <= 0:
+        raise ValueError("denoise_strength must be a positive finite number")
+    _factor_grid(candidates_per_panel, tall=True)
     scan_number = scan_number_from_source(scan_source)
     output_path = default_roi_path(scan_number)
     image = np.asarray(image)
@@ -939,12 +1462,51 @@ def interactive_roi(
         ) from exc
 
     mode_label = widgets.HTML(value=f"ROI mode: <b>{mode}</b>")
+    method_input = widgets.Dropdown(
+        options=DETECTION_METHODS,
+        value=method,
+        description="Method:",
+        tooltip="Adaptive uses multi-scale panel-aware detection",
+    )
+    candidates_per_panel_input = widgets.BoundedIntText(
+        value=candidates_per_panel,
+        min=1,
+        max=100,
+        description="Per panel:",
+        tooltip="Expected analyser count in each detector panel",
+        disabled=method != "adaptive",
+    )
+    min_confidence_input = widgets.BoundedFloatText(
+        value=min_confidence,
+        min=0.0,
+        max=1.0,
+        step=0.05,
+        description="Confidence:",
+        tooltip="Set to 0 to retain all grid hypotheses",
+        disabled=method != "adaptive",
+    )
+    denoise_method_input = widgets.Dropdown(
+        options=DENOISE_METHODS,
+        value=selected_denoise_method,
+        description="Denoise:",
+        tooltip="Applied only to the detection copy; raw counts stay unchanged",
+        disabled=method != "adaptive",
+    )
+    denoise_strength_input = widgets.BoundedFloatText(
+        value=denoise_strength,
+        min=0.1,
+        max=10.0,
+        step=0.1,
+        description="Strength:",
+        disabled=method != "adaptive" or selected_denoise_method == "none",
+    )
     threshold_percentile_input = widgets.BoundedFloatText(
         value=threshold_percentile,
         min=0.1,
         max=99.9,
         step=0.1,
         description="Percentile:",
+        disabled=method == "adaptive",
     )
     threshold_sigma_input = widgets.BoundedFloatText(
         value=threshold_sigma,
@@ -952,6 +1514,7 @@ def interactive_roi(
         max=100.0,
         step=0.5,
         description="Sigma factor:",
+        disabled=method == "adaptive",
     )
     min_area_input = widgets.BoundedIntText(
         value=min_area,
@@ -994,9 +1557,15 @@ def interactive_roi(
     output = widgets.Output()
     state: dict[str, Any] = {
         "mode": mode,
+        "detection_method": method,
         "scan_number": scan_number,
         "candidates": [],
         "run_button": run_button,
+        "method_input": method_input,
+        "candidates_per_panel_input": candidates_per_panel_input,
+        "min_confidence_input": min_confidence_input,
+        "denoise_method_input": denoise_method_input,
+        "denoise_strength_input": denoise_strength_input,
         "threshold_percentile_input": threshold_percentile_input,
         "threshold_sigma_input": threshold_sigma_input,
         "min_area_input": min_area_input,
@@ -1014,6 +1583,12 @@ def interactive_roi(
             candidates = detect_candidates(
                 image,
                 roi_mode=mode,
+                detection_method=method_input.value,
+                candidates_per_panel=candidates_per_panel_input.value,
+                seam_margin=seam_margin,
+                min_confidence=min_confidence_input.value,
+                denoise_method=denoise_method_input.value,
+                denoise_strength=denoise_strength_input.value,
                 min_area=min_area_input.value,
                 max_area=selected_max_area,
                 threshold_percentile=threshold_percentile_input.value,
@@ -1027,9 +1602,13 @@ def interactive_roi(
             status.value = f"ROI detection failed: {exc}"
             return
         state["candidates"] = candidates
+        state["detection_method"] = method_input.value
+        method_description = method_input.value
+        if method_input.value == "adaptive":
+            method_description += f" / {denoise_method_input.value} denoise"
         status.value = (
             f"Detected <b>{len(candidates)}</b> candidate(s) in "
-            f"<b>{mode}</b> mode."
+            f"<b>{mode}</b> mode using <b>{method_description}</b>."
         )
         with output:
             clear_output(wait=True)
@@ -1064,9 +1643,31 @@ def interactive_roi(
 
     run_button.on_click(run_detection)
     save_button.on_click(save_detection)
+
+    def update_method_controls(change: Any) -> None:
+        adaptive = change["new"] == "adaptive"
+        candidates_per_panel_input.disabled = not adaptive
+        min_confidence_input.disabled = not adaptive
+        denoise_method_input.disabled = not adaptive
+        denoise_strength_input.disabled = (
+            not adaptive or denoise_method_input.value == "none"
+        )
+        threshold_percentile_input.disabled = adaptive
+        threshold_sigma_input.disabled = adaptive
+
+    method_input.observe(update_method_controls, names="value")
+
+    def update_denoise_controls(change: Any) -> None:
+        denoise_strength_input.disabled = (
+            method_input.value != "adaptive" or change["new"] == "none"
+        )
+
+    denoise_method_input.observe(update_denoise_controls, names="value")
     controls = widgets.VBox(
         (
-            widgets.HBox((mode_label, run_button)),
+            widgets.HBox((mode_label, method_input, run_button)),
+            widgets.HBox((candidates_per_panel_input, min_confidence_input)),
+            widgets.HBox((denoise_method_input, denoise_strength_input)),
             widgets.HBox((threshold_percentile_input, threshold_sigma_input)),
             widgets.HBox((min_area_input, max_area_input, approximation_input)),
             widgets.HBox((output_name_field, save_button)),
