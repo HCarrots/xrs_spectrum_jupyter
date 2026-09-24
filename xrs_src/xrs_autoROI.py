@@ -254,6 +254,7 @@ def annotate_candidates(
     *,
     roi_mode: str = "free",
     valid_labels: Iterable[str] = VALID_LABELS,
+    figsize: tuple[float, float] = (8.0, 6.0),
 ) -> list[dict[str, Any]]:
     """Assign analyser labels interactively to detected ROI candidates."""
 
@@ -268,7 +269,7 @@ def annotate_candidates(
 
     valid_labels = tuple(valid_labels)
     selected: dict[str, dict[str, Any] | None] = {"candidate": None}
-    figure = plt.figure(figsize=(16, 10))
+    figure = plt.figure(figsize=figsize)
     axis = figure.add_axes((0.05, 0.08, 0.61, 0.86))
     axis.imshow(image, cmap="gray", origin="upper")
     axis.set_xlabel("Pixel x")
@@ -448,6 +449,7 @@ def interactive_roi(
     *,
     initial_mode: str = "free",
     valid_labels: Iterable[str] = VALID_LABELS,
+    figsize: tuple[float, float] = (8.0, 6.0),
     **detection_kwargs: Any,
 ) -> dict[str, Any]:
     """Display Jupyter controls for choosing, detecting, and labelling ROIs.
@@ -518,6 +520,7 @@ def interactive_roi(
                     candidates,
                     roi_mode=selected_mode,
                     valid_labels=valid_labels,
+                    figsize=figsize,
                 )
             else:
                 print("No ROI candidates were detected with the current settings.")
